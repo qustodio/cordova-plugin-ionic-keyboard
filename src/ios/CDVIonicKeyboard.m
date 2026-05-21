@@ -119,6 +119,67 @@ NSString* UITraitsClassString;
         [nc removeObserver:self.webView name:UIKeyboardWillChangeFrameNotification object:nil];
         [nc removeObserver:self.webView name:UIKeyboardDidChangeFrameNotification object:nil];
     }
+
+    // iOS 26 regression workaround: see -installAccessoryDoneOverride.
+    if (@available(iOS 16.0, *)) {
+        [CDVIonicKeyboard installAccessoryDoneOverride];
+    }
+}
+
+#pragma mark Accessory "Done" override (iOS 26 keyboard re-open workaround)
+
+// In iOS 26.0 there is a WKWebView regression (rdar://162423793, WebKit bug 305617)
+// where -[WKContentView accessoryViewDone:] does not reset _activeFocusedStateRetainCount.
+// When that counter has been leaked (commonly by Safari AutoFill via -_retainActiveFocusedState),
+// pressing "Done" causes WKWebView to immediately re-focus the input, re-opening the keyboard.
+//
+// We can't reset that private counter from a plugin, but we can ensure the keyboard
+// is actually dismissed by sending -resignFirstResponder through the public responder
+// chain right after WKWebView's own done logic runs. On iOS 26.1+ (Apple's fix) and
+// earlier versions this is a harmless no-op because the first responder has already
+// resigned, but on iOS 26.0 it pre-empts the spurious re-focus.
+static IMP CDVIonicKeyboardOriginalAccessoryDoneImp = NULL;
+static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
+
++ (void)installAccessoryDoneOverride
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class wkContentViewClass = NSClassFromString(WKClassString);
+        if (!wkContentViewClass) {
+            return;
+        }
+
+        SEL accessoryDoneSel = NSSelectorFromString(@"accessoryDone");
+        Method accessoryDoneMethod = class_getInstanceMethod(wkContentViewClass, accessoryDoneSel);
+        if (accessoryDoneMethod) {
+            CDVIonicKeyboardOriginalAccessoryDoneImp = method_getImplementation(accessoryDoneMethod);
+            IMP newImp = imp_implementationWithBlock(^(id wkContentView) {
+                ((void (*)(id, SEL))CDVIonicKeyboardOriginalAccessoryDoneImp)(wkContentView, accessoryDoneSel);
+                [CDVIonicKeyboard forceDismissAfterAccessoryDone];
+            });
+            method_setImplementation(accessoryDoneMethod, newImp);
+        }
+
+        SEL accessoryViewDoneSel = NSSelectorFromString(@"accessoryViewDone:");
+        Method accessoryViewDoneMethod = class_getInstanceMethod(wkContentViewClass, accessoryViewDoneSel);
+        if (accessoryViewDoneMethod) {
+            CDVIonicKeyboardOriginalAccessoryViewDoneImp = method_getImplementation(accessoryViewDoneMethod);
+            IMP newImp = imp_implementationWithBlock(^(id wkContentView, id view) {
+                ((void (*)(id, SEL, id))CDVIonicKeyboardOriginalAccessoryViewDoneImp)(wkContentView, accessoryViewDoneSel, view);
+                [CDVIonicKeyboard forceDismissAfterAccessoryDone];
+            });
+            method_setImplementation(accessoryViewDoneMethod, newImp);
+        }
+    });
+}
+
++ (void)forceDismissAfterAccessoryDone
+{
+    [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder)
+                                               to:nil
+                                             from:nil
+                                          forEvent:nil];
 }
 
 -(void)statusBarDidChangeFrame:(NSNotification*)notification
