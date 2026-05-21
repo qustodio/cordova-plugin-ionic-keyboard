@@ -141,7 +141,30 @@ NSString* UITraitsClassString;
         [self setKeyboardHeight:0 delay:0.01];
         [self resetScrollView];
     }
+
+    // iOS 16+ workaround: when the keyboard is dismissed (e.g. via the "Done" button) WKWebView
+    // does not blur the focused HTML element automatically. As a result the element keeps the
+    // focus and the keyboard can remain visible or reappear. Force a blur on the active element
+    // when it is an editable one. Safe for iOS 16 onwards (including iOS 26+).
+    if (@available(iOS 16.0, *)) {
+        [self blurActiveEditableElement];
+    }
+
     hideTimer = [NSTimer scheduledTimerWithTimeInterval:0 target:self selector:@selector(fireOnHiding) userInfo:nil repeats:NO];
+}
+
+- (void)blurActiveEditableElement
+{
+    NSString *blurJs = @"(function(){"
+        "try {"
+        "  var el = document.activeElement;"
+        "  if (!el || el === document.body) { return; }"
+        "  var tag = el.tagName;"
+        "  var isEditable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;"
+        "  if (isEditable && typeof el.blur === 'function') { el.blur(); }"
+        "} catch (e) {}"
+        "})();";
+    [self.commandDelegate evalJs:blurJs];
 }
 
 - (void)fireOnHiding {
@@ -363,6 +386,12 @@ static IMP WKOriginalImp;
 - (void)hide:(CDVInvokedUrlCommand *)command
 {
     [self.webView endEditing:YES];
+
+    // On iOS 16+ endEditing: does not always remove the focus from the underlying HTML element,
+    // so the keyboard may stay visible. Force a blur on the active element from JS too.
+    if (@available(iOS 16.0, *)) {
+        [self blurActiveEditableElement];
+    }
 }
 
 - (void)setResizeMode:(CDVInvokedUrlCommand *)command

@@ -100,4 +100,61 @@ Keyboard.setKeyboardStyle = function(style) {
 
 Keyboard.isVisible = false;
 
+// iOS 16+ workaround: WKWebView does not automatically blur the focused HTML element
+// when the user dismisses the keyboard (e.g. tapping outside an input or pressing "Done").
+// As a result the keyboard can stay visible or reappear. We blur the active editable
+// element when the user taps outside of any editable element. This complements the
+// native side fix triggered on UIKeyboardWillHideNotification.
+//
+// Restricted to iOS >= 16 so that the behaviour of older iOS versions stays untouched.
+(function () {
+    if (typeof navigator === 'undefined' || typeof document === 'undefined') {
+        return;
+    }
+
+    var ua = navigator.userAgent || '';
+    var match = ua.match(/OS (\d+)[_.](\d+)(?:[_.](\d+))? like Mac OS X/);
+    if (!match) {
+        return;
+    }
+    var major = parseInt(match[1], 10);
+    if (isNaN(major) || major < 16) {
+        return;
+    }
+
+    var EDITABLE_TAGS = { INPUT: true, TEXTAREA: true, SELECT: true };
+
+    function isEditable(el) {
+        if (!el || el === document.body) {
+            return false;
+        }
+        return EDITABLE_TAGS[el.tagName] === true || el.isContentEditable === true;
+    }
+
+    function onTouchEnd(event) {
+        var active = document.activeElement;
+        if (!isEditable(active)) {
+            return;
+        }
+        var tapped = event.target;
+        if (tapped === active) {
+            return;
+        }
+        if (tapped && typeof tapped.closest === 'function' && tapped.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) {
+            return;
+        }
+        active.blur();
+    }
+
+    function attach() {
+        if (document.body) {
+            document.body.addEventListener('touchend', onTouchEnd, true);
+        } else {
+            document.addEventListener('DOMContentLoaded', attach, { once: true });
+        }
+    }
+
+    attach();
+})();
+
 module.exports = Keyboard;
