@@ -21,6 +21,7 @@
 #import <Cordova/CDVAvailability.h>
 #import <Cordova/NSDictionary+CordovaPreferences.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 typedef enum : NSUInteger {
     ResizeNone,
@@ -46,6 +47,12 @@ typedef enum : NSUInteger {
 @property (nonatomic, assign) BOOL inForceDismiss;
 
 @end
+
+// Weak reference to the most recently initialized plugin instance, used by the
+// accessoryDone swizzle (a class-level callback) to reach a live instance and
+// trigger the hard-dismiss path. Declared at file scope so it is visible from
+// both -pluginInitialize and the class methods further below.
+static __weak CDVIonicKeyboard *CDVIonicKeyboardSharedInstance = nil;
 
 @implementation CDVIonicKeyboard
 
@@ -123,6 +130,7 @@ NSString* UITraitsClassString;
     }
 
     // iOS 26 regression workaround: see -installAccessoryDoneOverride.
+    CDVIonicKeyboardSharedInstance = self;
     if (@available(iOS 16.0, *)) {
         [CDVIonicKeyboard installAccessoryDoneOverride];
     }
@@ -152,6 +160,8 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
             NSLog(@"CDVIonicKeyboard: WKContentView class not found, skipping accessoryDone swizzle");
             return;
         }
+
+        [CDVIonicKeyboard dumpKeyboardRelatedSelectorsForClass:wkContentViewClass];
 
         BOOL installed = NO;
 
@@ -185,12 +195,84 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     });
 }
 
+// Diagnostic: enumerate every WKContentView instance method whose name contains
+// "done", "accessory", "dismiss" or "keyboard". This tells us exactly which selector
+// Apple is wiring the ✓ accessory button to in any given iOS version, so we can
+// expand the swizzle list when a new one appears.
++ (void)dumpKeyboardRelatedSelectorsForClass:(Class)cls
+{
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) return;
+
+    NSArray<NSString *> *needles = @[@"done", @"accessory", @"dismiss", @"keyboard"];
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
+        NSString *lower = [name lowercaseString];
+        for (NSString *needle in needles) {
+            if ([lower containsString:needle]) {
+                NSLog(@"CDVIonicKeyboard: WKContentView selector candidate: %@", name);
+                break;
+            }
+        }
+    }
+    free(methods);
+}
+
 + (void)forceDismissAfterAccessoryDone
 {
+    CDVIonicKeyboard *plugin = CDVIonicKeyboardSharedInstance;
+    if (plugin) {
+        [plugin hardDismissKeyboard];
+    }
+}
+
+// Hard dismiss: combines every public + private mechanism that has been
+// observed to release the focused element on iOS 16–26.x. Called from both
+// the accessoryDone swizzle and the spurious-reopen detector in
+// onKeyboardWillShow:.
+- (void)hardDismissKeyboard
+{
+    UIView *webView = (UIView *)self.webView;
+
+    // 1) Apple's own fix (iOS 26.1+). The selector lives on WKWebView. We
+    //    call it dynamically so the plugin keeps building against older SDKs.
+    //    On iOS versions where the selector is absent this is a silent no-op.
+    SEL fullResetSel = NSSelectorFromString(@"_resetFocusPreservationCountAndReleaseActiveFocusState");
+    SEL legacyResetSel = NSSelectorFromString(@"_resetFocusPreservationCount");
+    if ([webView respondsToSelector:fullResetSel]) {
+        NSLog(@"CDVIonicKeyboard: calling _resetFocusPreservationCountAndReleaseActiveFocusState");
+        ((void (*)(id, SEL))objc_msgSend)(webView, fullResetSel);
+    } else if ([webView respondsToSelector:legacyResetSel]) {
+        NSLog(@"CDVIonicKeyboard: calling _resetFocusPreservationCount (legacy)");
+        ((void (*)(id, SEL))objc_msgSend)(webView, legacyResetSel);
+    }
+
+    // 2) Standard public dismissal paths.
+    [webView endEditing:YES];
     [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder)
-                                               to:nil
-                                             from:nil
-                                          forEvent:nil];
+                                               to:nil from:nil forEvent:nil];
+
+    // 3) JS guarantee: blur the active element AND temporarily make it
+    //    non-focusable for 500ms via tabindex=-1, so WebKit cannot re-focus
+    //    it (the redesigned iOS 26 password AutoFill is the prime suspect).
+    NSString *js = @"(function(){"
+        "try {"
+        "  var el = document.activeElement;"
+        "  if (!el || el === document.body) return;"
+        "  var tag = el.tagName;"
+        "  var editable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;"
+        "  if (!editable) return;"
+        "  var prev = el.getAttribute('tabindex');"
+        "  el.setAttribute('tabindex', '-1');"
+        "  if (typeof el.blur === 'function') el.blur();"
+        "  setTimeout(function(){"
+        "    if (prev === null) el.removeAttribute('tabindex');"
+        "    else el.setAttribute('tabindex', prev);"
+        "  }, 500);"
+        "} catch (e) {}"
+        "})();";
+    [self.commandDelegate evalJs:js];
 }
 
 -(void)statusBarDidChangeFrame:(NSNotification*)notification
@@ -258,24 +340,21 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     // iOS 26 safety net: if a WillShow notification arrives shortly after a WillHide
     // and we are not currently in the middle of a forced dismiss, treat it as a spurious
     // reopen (e.g. password AutoFill re-focusing the input after the user pressed Done in
-    // the accessory bar) and force the keyboard back down through the public responder
-    // chain. Genuine field-to-field switches normally fire UIKeyboardWillChangeFrame
-    // instead of a hide/show pair, so this window should not trigger on legitimate cases.
+    // the accessory bar) and force the keyboard back down using every public+private
+    // mechanism we have. Genuine field-to-field switches normally fire
+    // UIKeyboardWillChangeFrame instead of a hide/show pair, so this window should not
+    // trigger on legitimate cases. The 1.0s window is intentionally generous to cover
+    // the slower iOS 26.4 animation timings observed in the wild.
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     NSTimeInterval elapsed = now - self.lastHideAt;
-    if (self.lastHideAt > 0 && elapsed < 0.4 && !self.inForceDismiss) {
+    if (self.lastHideAt > 0 && elapsed < 1.0 && !self.inForceDismiss) {
         NSLog(@"CDVIonicKeyboard: spurious keyboard reopen detected (%.0fms after hide), forcing dismiss", elapsed * 1000);
         self.lastHideAt = 0;
         self.inForceDismiss = YES;
         __weak CDVIonicKeyboard *weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder)
-                                                       to:nil from:nil forEvent:nil];
-            [weakSelf.webView endEditing:YES];
-            if (@available(iOS 16.0, *)) {
-                [weakSelf blurActiveEditableElement];
-            }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+            [CDVIonicKeyboard hardDismissKeyboard:weakSelf.commandDelegate];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 weakSelf.inForceDismiss = NO;
             });
