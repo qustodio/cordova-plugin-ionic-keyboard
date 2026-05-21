@@ -42,6 +42,8 @@ typedef enum : NSUInteger {
 @property (readwrite, assign, nonatomic) NSString* keyboardStyle;
 @property (nonatomic, readwrite) BOOL isWK;
 @property (nonatomic, readwrite) int paddingBottom;
+@property (nonatomic, assign) NSTimeInterval lastHideAt;
+@property (nonatomic, assign) BOOL inForceDismiss;
 
 @end
 
@@ -147,18 +149,23 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     dispatch_once(&onceToken, ^{
         Class wkContentViewClass = NSClassFromString(WKClassString);
         if (!wkContentViewClass) {
+            NSLog(@"CDVIonicKeyboard: WKContentView class not found, skipping accessoryDone swizzle");
             return;
         }
+
+        BOOL installed = NO;
 
         SEL accessoryDoneSel = NSSelectorFromString(@"accessoryDone");
         Method accessoryDoneMethod = class_getInstanceMethod(wkContentViewClass, accessoryDoneSel);
         if (accessoryDoneMethod) {
             CDVIonicKeyboardOriginalAccessoryDoneImp = method_getImplementation(accessoryDoneMethod);
             IMP newImp = imp_implementationWithBlock(^(id wkContentView) {
+                NSLog(@"CDVIonicKeyboard: accessoryDone fired");
                 ((void (*)(id, SEL))CDVIonicKeyboardOriginalAccessoryDoneImp)(wkContentView, accessoryDoneSel);
                 [CDVIonicKeyboard forceDismissAfterAccessoryDone];
             });
             method_setImplementation(accessoryDoneMethod, newImp);
+            installed = YES;
         }
 
         SEL accessoryViewDoneSel = NSSelectorFromString(@"accessoryViewDone:");
@@ -166,11 +173,15 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         if (accessoryViewDoneMethod) {
             CDVIonicKeyboardOriginalAccessoryViewDoneImp = method_getImplementation(accessoryViewDoneMethod);
             IMP newImp = imp_implementationWithBlock(^(id wkContentView, id view) {
+                NSLog(@"CDVIonicKeyboard: accessoryViewDone: fired");
                 ((void (*)(id, SEL, id))CDVIonicKeyboardOriginalAccessoryViewDoneImp)(wkContentView, accessoryViewDoneSel, view);
                 [CDVIonicKeyboard forceDismissAfterAccessoryDone];
             });
             method_setImplementation(accessoryViewDoneMethod, newImp);
+            installed = YES;
         }
+
+        NSLog(@"CDVIonicKeyboard: accessoryDone swizzle installed=%@", installed ? @"YES" : @"NO");
     });
 }
 
@@ -211,6 +222,12 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         [self blurActiveEditableElement];
     }
 
+    // Record the time of this hide so onKeyboardWillShow: can detect spurious "reopens"
+    // (e.g. iOS 26 password AutoFill re-focusing the input after Done was pressed).
+    if (!self.inForceDismiss) {
+        self.lastHideAt = [[NSDate date] timeIntervalSince1970];
+    }
+
     hideTimer = [NSTimer scheduledTimerWithTimeInterval:0 target:self selector:@selector(fireOnHiding) userInfo:nil repeats:NO];
 }
 
@@ -237,6 +254,35 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     if (hideTimer != nil) {
         [hideTimer invalidate];
     }
+
+    // iOS 26 safety net: if a WillShow notification arrives shortly after a WillHide
+    // and we are not currently in the middle of a forced dismiss, treat it as a spurious
+    // reopen (e.g. password AutoFill re-focusing the input after the user pressed Done in
+    // the accessory bar) and force the keyboard back down through the public responder
+    // chain. Genuine field-to-field switches normally fire UIKeyboardWillChangeFrame
+    // instead of a hide/show pair, so this window should not trigger on legitimate cases.
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval elapsed = now - self.lastHideAt;
+    if (self.lastHideAt > 0 && elapsed < 0.4 && !self.inForceDismiss) {
+        NSLog(@"CDVIonicKeyboard: spurious keyboard reopen detected (%.0fms after hide), forcing dismiss", elapsed * 1000);
+        self.lastHideAt = 0;
+        self.inForceDismiss = YES;
+        __weak CDVIonicKeyboard *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder)
+                                                       to:nil from:nil forEvent:nil];
+            [weakSelf.webView endEditing:YES];
+            if (@available(iOS 16.0, *)) {
+                [weakSelf blurActiveEditableElement];
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                weakSelf.inForceDismiss = NO;
+            });
+        });
+        return;
+    }
+
     CGRect rect = [[note.userInfo valueForKey:UIKeyboardFrameEndUserInfoKey] CGRectValue];
     double height = rect.size.height;
 
