@@ -45,6 +45,14 @@ typedef enum : NSUInteger {
 @property (nonatomic, readwrite) int paddingBottom;
 @property (nonatomic, assign) NSTimeInterval lastHideAt;
 @property (nonatomic, assign) BOOL inForceDismiss;
+// Generation counter used to cancel pending "close the force window" timers
+// when the system keeps trying to reshow. Each willShow during a fight bumps
+// this; only the timer holding the current value actually closes the window.
+@property (nonatomic, assign) NSUInteger forceDismissGeneration;
+
+- (void)installFocusInterceptor;
+- (void)hardDismissKeyboard;
+- (void)blurActiveEditableElement;
 
 @end
 
@@ -178,7 +186,60 @@ NSString* UITraitsClassString;
     CDVIonicKeyboardSharedInstance = self;
     if (@available(iOS 16.0, *)) {
         [CDVIonicKeyboard installAccessoryDoneOverride];
+        // Defer the JS focus interceptor install until the next runloop so the
+        // web view has finished loading the bridge.
+        __weak CDVIonicKeyboard *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf installFocusInterceptor];
+        });
     }
+}
+
+// Installs a one-shot persistent focusin listener in the page. While
+// window.__cdv_kb_block_until is in the future, any focus attempt on an
+// editable element is redirected to a hidden focus sink. This wins the race
+// against WebKit re-focusing the input after Done because it fires
+// synchronously inside the focus dispatch, before the keyboard show animation
+// has a chance to start.
+- (void)installFocusInterceptor
+{
+    NSString *js = @"(function(){"
+        "try {"
+        "  if (window.__cdv_kb_initialized) return;"
+        "  window.__cdv_kb_initialized = true;"
+        "  window.__cdv_kb_block_until = 0;"
+        "  var SINK_ID = '__cdv_kb_focus_sink';"
+        "  function getSink() {"
+        "    var sink = document.getElementById(SINK_ID);"
+        "    if (!sink) {"
+        "      sink = document.createElement('button');"
+        "      sink.id = SINK_ID;"
+        "      sink.type = 'button';"
+        "      sink.setAttribute('aria-hidden', 'true');"
+        "      sink.tabIndex = -1;"
+        "      sink.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';"
+        "      (document.body || document.documentElement).appendChild(sink);"
+        "    }"
+        "    return sink;"
+        "  }"
+        "  window.__cdv_kb_getSink = getSink;"
+        "  document.addEventListener('focusin', function(e) {"
+        "    if (Date.now() >= window.__cdv_kb_block_until) return;"
+        "    var t = e.target;"
+        "    if (!t) return;"
+        "    var tag = t.tagName;"
+        "    var editable = tag === 'INPUT' || tag === 'TEXTAREA' || t.isContentEditable === true;"
+        "    if (!editable) return;"
+        "    if (typeof t.blur === 'function') t.blur();"
+        "    var sink = getSink();"
+        "    if (sink && typeof sink.focus === 'function') {"
+        "      try { sink.focus({ preventScroll: true }); } catch (err) { sink.focus(); }"
+        "    }"
+        "  }, true);"
+        "} catch (e) {}"
+        "})();";
+    [self.commandDelegate evalJs:js];
+    [CDVIonicKeyboard debugLog:@"focus interceptor installed"];
 }
 
 #pragma mark Accessory "Done" override (iOS 26 keyboard re-open workaround)
@@ -308,18 +369,24 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder)
                                                to:nil from:nil forEvent:nil];
 
-    // 3) JS guarantee: blur the active element AND park focus on a hidden
-    //    "sink" button so WebKit cannot keep treating the input as the
-    //    focused element when it tries to re-show the keyboard. The sink is
-    //    created once and reused. We blur it shortly after so no element
-    //    retains focus.
+    // 3) JS: arm the focusin interceptor for ~1s, blur the active element and
+    //    park focus on the hidden sink. The interceptor (installed once at
+    //    plugin init) wins the race against WebKit re-focusing the input,
+    //    because it runs synchronously inside the focus dispatch BEFORE the
+    //    keyboard show animation starts. The sink is auto-blurred shortly
+    //    after so no element retains focus.
     NSString *js = @"(function(){"
         "try {"
+        "  window.__cdv_kb_block_until = Date.now() + 1000;"
         "  var el = document.activeElement;"
         "  var tag = el && el.tagName;"
         "  var editable = el && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true);"
+        "  if (window.cordova && window.cordova.fireDocumentEvent) {"
+        "    try { window.cordova.fireDocumentEvent('keyboardWillDismiss', { activeTag: tag || 'none' }); } catch (er) {}"
+        "  }"
         "  if (editable && typeof el.blur === 'function') { el.blur(); }"
-        "  var sink = document.getElementById('__cdv_kb_focus_sink');"
+        "  var getSink = window.__cdv_kb_getSink;"
+        "  var sink = getSink ? getSink() : null;"
         "  if (!sink) {"
         "    sink = document.createElement('button');"
         "    sink.id = '__cdv_kb_focus_sink';"
@@ -329,8 +396,10 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         "    sink.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';"
         "    (document.body || document.documentElement).appendChild(sink);"
         "  }"
-        "  if (typeof sink.focus === 'function') { sink.focus({ preventScroll: true }); }"
-        "  setTimeout(function(){ if (sink && sink.blur) sink.blur(); }, 80);"
+        "  if (typeof sink.focus === 'function') {"
+        "    try { sink.focus({ preventScroll: true }); } catch (err) { sink.focus(); }"
+        "  }"
+        "  setTimeout(function(){ if (sink && sink.blur) sink.blur(); }, 120);"
         "} catch (e) {}"
         "})();";
     [self.commandDelegate evalJs:js];
@@ -404,32 +473,36 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"willShow (sinceHide=%.0fms, forced=%@)",
                                 elapsed * 1000, self.inForceDismiss ? @"YES" : @"NO"]];
 
-    // iOS 26 safety net: WebKit reshows the keyboard 50–100ms after a Done dismissal
-    // and then retries 2–3 times over the next ~300ms. A one-shot dismiss loses the
-    // race, so we react to every willShow that arrives during the suspicion window
-    // and dispatch another hardDismiss. The first detection arms an 800ms "force
-    // window" during which any willShow keeps triggering a dismiss; the window then
-    // expires and lastHideAt resets. Genuine field-to-field navigation uses
+    // iOS 26 safety net: WebKit reshows the keyboard 50–900ms after a Done dismissal
+    // and may retry multiple times. The fight window is *adaptive*: every willShow
+    // that arrives during the fight pushes the close-timer back another 800ms, so we
+    // keep dismissing for as long as the system keeps trying. The window closes
+    // 800ms after the last reshow attempt. Genuine field-to-field navigation uses
     // UIKeyboardWillChangeFrame (not a hide/show pair), so legitimate cases are not
     // affected.
-    BOOL recentHide = self.lastHideAt > 0 && elapsed < 1.0;
+    BOOL recentHide = self.lastHideAt > 0 && elapsed < 1.2;
     if (recentHide || self.inForceDismiss) {
         if (!self.inForceDismiss) {
             [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"spurious reopen detected (%.0fms after hide), starting fight", elapsed * 1000]];
             self.inForceDismiss = YES;
-            __weak CDVIonicKeyboard *weakSelf = self;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                weakSelf.inForceDismiss = NO;
-                weakSelf.lastHideAt = 0;
-                [CDVIonicKeyboard debugLog:@"force-dismiss window closed"];
-            });
         } else {
-            [CDVIonicKeyboard debugLog:@"reshow during force window, re-dismissing"];
+            [CDVIonicKeyboard debugLog:@"reshow during force window, extending"];
         }
+        // Bump the generation so any previously scheduled "close window" timer
+        // becomes a no-op, then schedule a new one 800ms out.
+        NSUInteger generation = ++self.forceDismissGeneration;
+        __weak CDVIonicKeyboard *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            CDVIonicKeyboard *strongSelf = weakSelf;
+            if (!strongSelf) { return; }
+            if (strongSelf.forceDismissGeneration != generation) { return; }
+            strongSelf.inForceDismiss = NO;
+            strongSelf.lastHideAt = 0;
+            [CDVIonicKeyboard debugLog:@"force-dismiss window closed"];
+        });
         // Defer to next runloop so UIKit finishes processing the current
         // willShow notification before we send endEditing:YES.
-        __weak CDVIonicKeyboard *weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf hardDismissKeyboard];
         });
