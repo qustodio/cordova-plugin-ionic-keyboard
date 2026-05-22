@@ -415,7 +415,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         self.inForceDismiss = YES;
         __weak CDVIonicKeyboard *weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [CDVIonicKeyboard hardDismissKeyboard:weakSelf.commandDelegate];
+            [weakSelf hardDismissKeyboard];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 weakSelf.inForceDismiss = NO;
