@@ -216,7 +216,10 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
             CDVIonicKeyboardOriginalAccessoryDoneImp = method_getImplementation(accessoryDoneMethod);
             IMP newImp = imp_implementationWithBlock(^(id wkContentView) {
                 [CDVIonicKeyboard debugLog:@"accessoryDone fired"];
-                ((void (*)(id, SEL))CDVIonicKeyboardOriginalAccessoryDoneImp)(wkContentView, accessoryDoneSel);
+                // Cast IMP via (void *) so Xcode 26's strict checking does not flag
+                // the conversion from the variadic IMP type to a fixed-arity function.
+                void (*originalFn)(id, SEL) = (void (*)(id, SEL))(void *)CDVIonicKeyboardOriginalAccessoryDoneImp;
+                originalFn(wkContentView, accessoryDoneSel);
                 [CDVIonicKeyboard forceDismissAfterAccessoryDone];
             });
             method_setImplementation(accessoryDoneMethod, newImp);
@@ -229,7 +232,8 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
             CDVIonicKeyboardOriginalAccessoryViewDoneImp = method_getImplementation(accessoryViewDoneMethod);
             IMP newImp = imp_implementationWithBlock(^(id wkContentView, id view) {
                 [CDVIonicKeyboard debugLog:@"accessoryViewDone: fired"];
-                ((void (*)(id, SEL, id))CDVIonicKeyboardOriginalAccessoryViewDoneImp)(wkContentView, accessoryViewDoneSel, view);
+                void (*originalFn)(id, SEL, id) = (void (*)(id, SEL, id))(void *)CDVIonicKeyboardOriginalAccessoryViewDoneImp;
+                originalFn(wkContentView, accessoryViewDoneSel, view);
                 [CDVIonicKeyboard forceDismissAfterAccessoryDone];
             });
             method_setImplementation(accessoryViewDoneMethod, newImp);
@@ -285,12 +289,16 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     //    On iOS versions where the selector is absent this is a silent no-op.
     SEL fullResetSel = NSSelectorFromString(@"_resetFocusPreservationCountAndReleaseActiveFocusState");
     SEL legacyResetSel = NSSelectorFromString(@"_resetFocusPreservationCount");
+    // Cast objc_msgSend via (void *) to silence the strict variadic-conversion
+    // error on Xcode 26 / arm64. NSInvocation would be safer, but the overhead
+    // is unjustified for a fire-and-forget call with no return value.
+    void (*msgSendVoidNoArg)(id, SEL) = (void (*)(id, SEL))(void *)objc_msgSend;
     if ([webView respondsToSelector:fullResetSel]) {
         [CDVIonicKeyboard debugLog:@"calling _resetFocusPreservationCountAndReleaseActiveFocusState"];
-        ((void (*)(id, SEL))objc_msgSend)(webView, fullResetSel);
+        msgSendVoidNoArg(webView, fullResetSel);
     } else if ([webView respondsToSelector:legacyResetSel]) {
         [CDVIonicKeyboard debugLog:@"calling _resetFocusPreservationCount (legacy)"];
-        ((void (*)(id, SEL))objc_msgSend)(webView, legacyResetSel);
+        msgSendVoidNoArg(webView, legacyResetSel);
     } else {
         [CDVIonicKeyboard debugLog:@"no private reset selector available on WKWebView"];
     }
