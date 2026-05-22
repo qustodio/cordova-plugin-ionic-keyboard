@@ -308,23 +308,29 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder)
                                                to:nil from:nil forEvent:nil];
 
-    // 3) JS guarantee: blur the active element AND temporarily make it
-    //    non-focusable for 500ms via tabindex=-1, so WebKit cannot re-focus
-    //    it (the redesigned iOS 26 password AutoFill is the prime suspect).
+    // 3) JS guarantee: blur the active element AND park focus on a hidden
+    //    "sink" button so WebKit cannot keep treating the input as the
+    //    focused element when it tries to re-show the keyboard. The sink is
+    //    created once and reused. We blur it shortly after so no element
+    //    retains focus.
     NSString *js = @"(function(){"
         "try {"
         "  var el = document.activeElement;"
-        "  if (!el || el === document.body) return;"
-        "  var tag = el.tagName;"
-        "  var editable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;"
-        "  if (!editable) return;"
-        "  var prev = el.getAttribute('tabindex');"
-        "  el.setAttribute('tabindex', '-1');"
-        "  if (typeof el.blur === 'function') el.blur();"
-        "  setTimeout(function(){"
-        "    if (prev === null) el.removeAttribute('tabindex');"
-        "    else el.setAttribute('tabindex', prev);"
-        "  }, 500);"
+        "  var tag = el && el.tagName;"
+        "  var editable = el && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true);"
+        "  if (editable && typeof el.blur === 'function') { el.blur(); }"
+        "  var sink = document.getElementById('__cdv_kb_focus_sink');"
+        "  if (!sink) {"
+        "    sink = document.createElement('button');"
+        "    sink.id = '__cdv_kb_focus_sink';"
+        "    sink.type = 'button';"
+        "    sink.setAttribute('aria-hidden', 'true');"
+        "    sink.tabIndex = -1;"
+        "    sink.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';"
+        "    (document.body || document.documentElement).appendChild(sink);"
+        "  }"
+        "  if (typeof sink.focus === 'function') { sink.focus({ preventScroll: true }); }"
+        "  setTimeout(function(){ if (sink && sink.blur) sink.blur(); }, 80);"
         "} catch (e) {}"
         "})();";
     [self.commandDelegate evalJs:js];
@@ -393,33 +399,39 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         [hideTimer invalidate];
     }
 
-    NSTimeInterval elapsedSinceHide = self.lastHideAt > 0
-        ? ([[NSDate date] timeIntervalSince1970] - self.lastHideAt)
-        : -1;
-    [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"willShow (sinceHide=%.0fms, forced=%@)",
-                                elapsedSinceHide * 1000, self.inForceDismiss ? @"YES" : @"NO"]];
-
-    // iOS 26 safety net: if a WillShow notification arrives shortly after a WillHide
-    // and we are not currently in the middle of a forced dismiss, treat it as a spurious
-    // reopen (e.g. password AutoFill re-focusing the input after the user pressed Done in
-    // the accessory bar) and force the keyboard back down using every public+private
-    // mechanism we have. Genuine field-to-field switches normally fire
-    // UIKeyboardWillChangeFrame instead of a hide/show pair, so this window should not
-    // trigger on legitimate cases. The 1.0s window is intentionally generous to cover
-    // the slower iOS 26.4 animation timings observed in the wild.
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    NSTimeInterval elapsed = now - self.lastHideAt;
-    if (self.lastHideAt > 0 && elapsed < 1.0 && !self.inForceDismiss) {
-        [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"spurious reopen detected (%.0fms after hide), forcing dismiss", elapsed * 1000]];
-        self.lastHideAt = 0;
-        self.inForceDismiss = YES;
+    NSTimeInterval elapsed = self.lastHideAt > 0 ? (now - self.lastHideAt) : -1;
+    [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"willShow (sinceHide=%.0fms, forced=%@)",
+                                elapsed * 1000, self.inForceDismiss ? @"YES" : @"NO"]];
+
+    // iOS 26 safety net: WebKit reshows the keyboard 50–100ms after a Done dismissal
+    // and then retries 2–3 times over the next ~300ms. A one-shot dismiss loses the
+    // race, so we react to every willShow that arrives during the suspicion window
+    // and dispatch another hardDismiss. The first detection arms an 800ms "force
+    // window" during which any willShow keeps triggering a dismiss; the window then
+    // expires and lastHideAt resets. Genuine field-to-field navigation uses
+    // UIKeyboardWillChangeFrame (not a hide/show pair), so legitimate cases are not
+    // affected.
+    BOOL recentHide = self.lastHideAt > 0 && elapsed < 1.0;
+    if (recentHide || self.inForceDismiss) {
+        if (!self.inForceDismiss) {
+            [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"spurious reopen detected (%.0fms after hide), starting fight", elapsed * 1000]];
+            self.inForceDismiss = YES;
+            __weak CDVIonicKeyboard *weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                weakSelf.inForceDismiss = NO;
+                weakSelf.lastHideAt = 0;
+                [CDVIonicKeyboard debugLog:@"force-dismiss window closed"];
+            });
+        } else {
+            [CDVIonicKeyboard debugLog:@"reshow during force window, re-dismissing"];
+        }
+        // Defer to next runloop so UIKit finishes processing the current
+        // willShow notification before we send endEditing:YES.
         __weak CDVIonicKeyboard *weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf hardDismissKeyboard];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                weakSelf.inForceDismiss = NO;
-            });
         });
         return;
     }
