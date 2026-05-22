@@ -54,6 +54,51 @@ typedef enum : NSUInteger {
 // both -pluginInitialize and the class methods further below.
 static __weak CDVIonicKeyboard *CDVIonicKeyboardSharedInstance = nil;
 
+// In-app debug overlay: injects a fixed strip on top of the WKWebView and
+// appends log lines to it. Designed for situations where the app is built in
+// CI and the Xcode console / Console.app are not available. Always logs to
+// NSLog too so production diagnostics still work when a Mac is attached.
+@interface CDVIonicKeyboard (DebugOverlay)
++ (void)debugLog:(NSString *)message;
+@end
+
+@implementation CDVIonicKeyboard (DebugOverlay)
+
++ (void)debugLog:(NSString *)message
+{
+    NSLog(@"CDVIonicKeyboard: %@", message);
+
+    CDVIonicKeyboard *plugin = CDVIonicKeyboardSharedInstance;
+    if (!plugin) {
+        return;
+    }
+    NSString *escaped = [[message stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+                                  stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
+    NSString *js = [NSString stringWithFormat:
+        @"(function(m){"
+        "try {"
+        "  var p = document.getElementById('cdv-ionic-kb-debug');"
+        "  if (!p) {"
+        "    p = document.createElement('div');"
+        "    p.id = 'cdv-ionic-kb-debug';"
+        "    p.style.cssText = 'position:fixed;top:env(safe-area-inset-top,0);left:0;right:0;z-index:2147483647;background:rgba(0,0,0,.8);color:#0f0;font:10px/1.25 monospace;padding:6px 8px;max-height:45%%;overflow:hidden;pointer-events:none;white-space:pre;text-align:left;';"
+        "    (document.body || document.documentElement).appendChild(p);"
+        "  }"
+        "  var t = new Date();"
+        "  var pad = function(n, w){ n = String(n); while (n.length < w) n = '0' + n; return n; };"
+        "  var stamp = pad(t.getHours(),2)+':'+pad(t.getMinutes(),2)+':'+pad(t.getSeconds(),2)+'.'+pad(t.getMilliseconds(),3);"
+        "  var line = '['+stamp+'] '+m;"
+        "  var existing = p.textContent ? p.textContent.split('\\n') : [];"
+        "  existing.unshift(line);"
+        "  if (existing.length > 30) existing = existing.slice(0, 30);"
+        "  p.textContent = existing.join('\\n');"
+        "} catch(e) {}"
+        "})('%@');", escaped];
+    [plugin.commandDelegate evalJs:js];
+}
+
+@end
+
 @implementation CDVIonicKeyboard
 
 NSTimer *hideTimer;
@@ -157,7 +202,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     dispatch_once(&onceToken, ^{
         Class wkContentViewClass = NSClassFromString(WKClassString);
         if (!wkContentViewClass) {
-            NSLog(@"CDVIonicKeyboard: WKContentView class not found, skipping accessoryDone swizzle");
+            [CDVIonicKeyboard debugLog:@"WKContentView class not found, skipping accessoryDone swizzle"];
             return;
         }
 
@@ -170,7 +215,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         if (accessoryDoneMethod) {
             CDVIonicKeyboardOriginalAccessoryDoneImp = method_getImplementation(accessoryDoneMethod);
             IMP newImp = imp_implementationWithBlock(^(id wkContentView) {
-                NSLog(@"CDVIonicKeyboard: accessoryDone fired");
+                [CDVIonicKeyboard debugLog:@"accessoryDone fired"];
                 ((void (*)(id, SEL))CDVIonicKeyboardOriginalAccessoryDoneImp)(wkContentView, accessoryDoneSel);
                 [CDVIonicKeyboard forceDismissAfterAccessoryDone];
             });
@@ -183,7 +228,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         if (accessoryViewDoneMethod) {
             CDVIonicKeyboardOriginalAccessoryViewDoneImp = method_getImplementation(accessoryViewDoneMethod);
             IMP newImp = imp_implementationWithBlock(^(id wkContentView, id view) {
-                NSLog(@"CDVIonicKeyboard: accessoryViewDone: fired");
+                [CDVIonicKeyboard debugLog:@"accessoryViewDone: fired"];
                 ((void (*)(id, SEL, id))CDVIonicKeyboardOriginalAccessoryViewDoneImp)(wkContentView, accessoryViewDoneSel, view);
                 [CDVIonicKeyboard forceDismissAfterAccessoryDone];
             });
@@ -191,7 +236,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
             installed = YES;
         }
 
-        NSLog(@"CDVIonicKeyboard: accessoryDone swizzle installed=%@", installed ? @"YES" : @"NO");
+        [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"accessoryDone swizzle installed=%@", installed ? @"YES" : @"NO"]];
     });
 }
 
@@ -211,7 +256,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         NSString *lower = [name lowercaseString];
         for (NSString *needle in needles) {
             if ([lower containsString:needle]) {
-                NSLog(@"CDVIonicKeyboard: WKContentView selector candidate: %@", name);
+                [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"WKContentView selector: %@", name]];
                 break;
             }
         }
@@ -241,11 +286,13 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     SEL fullResetSel = NSSelectorFromString(@"_resetFocusPreservationCountAndReleaseActiveFocusState");
     SEL legacyResetSel = NSSelectorFromString(@"_resetFocusPreservationCount");
     if ([webView respondsToSelector:fullResetSel]) {
-        NSLog(@"CDVIonicKeyboard: calling _resetFocusPreservationCountAndReleaseActiveFocusState");
+        [CDVIonicKeyboard debugLog:@"calling _resetFocusPreservationCountAndReleaseActiveFocusState"];
         ((void (*)(id, SEL))objc_msgSend)(webView, fullResetSel);
     } else if ([webView respondsToSelector:legacyResetSel]) {
-        NSLog(@"CDVIonicKeyboard: calling _resetFocusPreservationCount (legacy)");
+        [CDVIonicKeyboard debugLog:@"calling _resetFocusPreservationCount (legacy)"];
         ((void (*)(id, SEL))objc_msgSend)(webView, legacyResetSel);
+    } else {
+        [CDVIonicKeyboard debugLog:@"no private reset selector available on WKWebView"];
     }
 
     // 2) Standard public dismissal paths.
@@ -309,6 +356,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     if (!self.inForceDismiss) {
         self.lastHideAt = [[NSDate date] timeIntervalSince1970];
     }
+    [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"willHide (forced=%@)", self.inForceDismiss ? @"YES" : @"NO"]];
 
     hideTimer = [NSTimer scheduledTimerWithTimeInterval:0 target:self selector:@selector(fireOnHiding) userInfo:nil repeats:NO];
 }
@@ -337,6 +385,12 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
         [hideTimer invalidate];
     }
 
+    NSTimeInterval elapsedSinceHide = self.lastHideAt > 0
+        ? ([[NSDate date] timeIntervalSince1970] - self.lastHideAt)
+        : -1;
+    [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"willShow (sinceHide=%.0fms, forced=%@)",
+                                elapsedSinceHide * 1000, self.inForceDismiss ? @"YES" : @"NO"]];
+
     // iOS 26 safety net: if a WillShow notification arrives shortly after a WillHide
     // and we are not currently in the middle of a forced dismiss, treat it as a spurious
     // reopen (e.g. password AutoFill re-focusing the input after the user pressed Done in
@@ -348,7 +402,7 @@ static IMP CDVIonicKeyboardOriginalAccessoryViewDoneImp = NULL;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     NSTimeInterval elapsed = now - self.lastHideAt;
     if (self.lastHideAt > 0 && elapsed < 1.0 && !self.inForceDismiss) {
-        NSLog(@"CDVIonicKeyboard: spurious keyboard reopen detected (%.0fms after hide), forcing dismiss", elapsed * 1000);
+        [CDVIonicKeyboard debugLog:[NSString stringWithFormat:@"spurious reopen detected (%.0fms after hide), forcing dismiss", elapsed * 1000]];
         self.lastHideAt = 0;
         self.inForceDismiss = YES;
         __weak CDVIonicKeyboard *weakSelf = self;
