@@ -76,6 +76,11 @@ static __weak CDVIonicKeyboard *CDVIonicKeyboardSharedInstance = nil;
 {
     NSLog(@"CDVIonicKeyboard: %@", message);
 
+    // In-app debug overlay disabled. Re-enable by removing the early-return
+    // below if you need to see the logs on-device without an Xcode console.
+    return;
+
+    /*
     CDVIonicKeyboard *plugin = CDVIonicKeyboardSharedInstance;
     if (!plugin) {
         return;
@@ -103,6 +108,7 @@ static __weak CDVIonicKeyboard *CDVIonicKeyboardSharedInstance = nil;
         "} catch(e) {}"
         "})('%@');", escaped];
     [plugin.commandDelegate evalJs:js];
+    */
 }
 
 @end
